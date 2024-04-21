@@ -1,0 +1,178 @@
+import pandas as pd
+import numpy as np
+import stan
+from datetime import datetime
+import matplotlib.dates as mdates
+
+import arviz as az
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import nest_asyncio
+nest_asyncio.apply()
+
+def bspline_basis(x, knots, degree):
+    """
+    Generates B-spline basis functions for given input values 'x', knots, and degree.
+    """
+    num_basis = len(knots) + degree - 1
+    B = np.zeros((len(x), num_basis))
+    for i in range(num_basis):
+        B[:, i] = np.clip((x - knots[i]) ** degree, 0, None)
+    return B
+
+def get_season(month):
+    if month in ["03", "04", "05"]:  # Spring: March, April, May
+        return 1
+    elif month in ["06", "07", "08"]:  # Summer: June, July, August
+        return 2
+    elif month in ["09", "10", "11"]:  # Fall: September, October, November
+        return 3
+    else:  # Winter: December, January, February
+        return 0
+
+if __name__ == '__main__':
+    
+    df = pd.read_csv('BPD_Part_1_Victim_Based_Crime_Data.csv')
+    
+    df = df[(df.Description == 'SHOOTING')+((df.Description == 'HOMICIDE')*(df.Weapon == 'FIREARM'))] # only looking at gun violence rows
+    
+    df = df.groupby('CrimeDate').size().reset_index(name='shootings')
+    df['CrimeDate'] = pd.to_datetime(df.CrimeDate).dt.strftime("%m/%d/%y")
+    
+    full_date_range = pd.date_range(start=df['CrimeDate'].min(), end=df['CrimeDate'].max(), freq='D').strftime("%m/%d/%y")
+    
+    df = pd.merge(pd.DataFrame({'CrimeDate': full_date_range}), df, on='CrimeDate',how='left')
+    df = df.fillna(0)
+    
+    ceasefire_fridays = [
+    "08/04/2017",
+    "11/03/2017",
+    "02/02/2018",
+    "05/11/2018",
+    "08/03/2018",
+    "11/02/2018",
+    "02/01/2019",
+    "05/10/2019",
+    "08/02/2019"
+    ]
+
+    ceasefire_fridays = [datetime.strptime(date_str, "%m/%d/%Y") for date_str in ceasefire_fridays]
+
+    # Generate the ceasefire weekends
+    ceasefire_weekends = [pd.date_range(start=friday, periods=3, freq='D') for friday in ceasefire_fridays]
+
+    # Flatten the list of datetime ranges
+    ceasefire_weekends = [date.strftime("%m/%d/%y") for sublist in ceasefire_weekends for date in sublist]
+    
+    df.loc[:,'ceasefire'] = np.zeros(len(df), dtype = int)
+    
+    df.ceasefire[df.CrimeDate.isin(ceasefire_weekends)] = 1
+    
+    # adding relevant date information, also encoding all
+    
+    df.loc[:,'weekday'] = pd.to_datetime(df.CrimeDate).dt.day_name().astype('category').cat.codes
+    df.loc[:,'yearday'] = pd.to_datetime(df.CrimeDate).dt.dayofyear
+    df.loc[:,'season'] = [get_season(c.split("/")[0]) for c in df.CrimeDate]
+    df.loc[:,'jul'] = pd.to_datetime(df.CrimeDate).apply(lambda x: x.toordinal())
+    
+    '''
+    * Overall time trend
+        + We use a spline to estimate the overall time trend, which allows for "curvy" relationships while avoiding overfitting
+        
+    * Yearly seasonality
+        + We account for yearly seasonality using a spline with a cyclical constraint to ensure that the seasonal effect begins where it ended
+        
+    * Day of the week
+        + We allow intercepts to vary for days of the week in case weekends have different patterns of shootings than weekdays
+        
+    * Calendar day
+        + We allow varying intercepts for each day of the year in case "special days", like Christmas, show different patterns of shootings 
+        
+    * Mother's Day
+        + We use a binary indicator for Mother's Day, which is the second Sunday in May and always coincides with ceasefire
+        
+    * Ceasefire effect
+        + We use a binary indicator for days occurring during ceasefire weekends to estimate the impact of ceasefire after accounting for all of the above
+    '''
+    N = len(df)
+    
+    data = {
+        'N': N,
+        'shootings': df['shootings'].values.astype(int),
+        'seasonal': df['season'].values.astype(int),
+        'ceasefire': df['ceasefire'].values.astype(int),
+        'weekday': df['weekday'].values.astype(int),
+        'calendar_day': df['yearday'].values.astype(int),
+    }
+
+    stan_code = """
+    data {
+    int<lower=0> N;                                     // number of observations
+    array[N] int<lower=0> shootings;                    // observed shootings counts
+    array[N] int<lower=0, upper=3> seasonal;            // seasonal effect
+    array[N] int<lower=0, upper=1> ceasefire;           // ceasefire indicator
+    array[N] int<lower=0, upper=6> weekday;             // day of the week
+    array[N] int<lower=0, upper=366> calendar_day;      // calendar day
+    }
+
+    parameters {
+    real alpha_raw;                   // unconstrained intercept
+    vector[N] beta_seasonal_raw;      // unconstrained seasonal effect coefficient
+    real ceasefire_effect_raw;        // unconstrained effect of ceasefire
+    real<lower=0> sigma_raw;          // unconstrained standard deviation
+    }
+
+    transformed parameters {
+        real alpha = alpha_raw;                                     // transform back to constrained scale
+        vector[N] beta_seasonal = beta_seasonal_raw;               // transform back to constrained scale
+        real ceasefire_effect = ceasefire_effect_raw;               // transform back to constrained scale
+        real<lower=0> sigma = sigma_raw;                            // transform back to constrained scale
+    }
+
+    model {
+        // Priors
+        alpha ~ normal(0.1, 1);
+        beta_seasonal_raw ~ normal(0.1, 1);
+        ceasefire_effect_raw ~ normal(0.1, 1);
+        sigma ~ normal(0.1, 1);
+
+        // Likelihood
+        for (i in 1:N) {
+            shootings[i] ~ poisson_log(alpha + beta_seasonal[i] * seasonal[i]
+                                        + ceasefire_effect * ceasefire[i]);
+        }
+    }
+    
+    generated quantities {
+        vector[N] lin_pred;  // linear predictor
+        vector[N] pred_low;  // lower bound of predictive interval
+        vector[N] pred_high; // upper bound of predictive interval
+
+        for (i in 1:N) {
+            lin_pred[i] = alpha + beta_seasonal[i] * seasonal[i] + 
+                ceasefire_effect * ceasefire[i];
+            pred_low[i] = poisson_rng(exp(lin_pred[i] - 1.28 * sigma));
+            pred_high[i] = poisson_rng(exp(lin_pred[i] + 1.28 * sigma));
+        }
+    }
+
+    """
+
+    # Compile the Stan model
+    model = stan.build(stan_code, data=data)
+    
+    fit = model.sample(num_chains=4, num_samples=500, num_warmup=500)
+
+    # Plotting
+    plt.figure(figsize=(10, 6))
+    plt.scatter(df['CrimeDate'], df['shootings'], alpha=0.2, label='Observations')
+    plt.plot(df['CrimeDate'], np.mean(fit['lin_pred'], axis=1), color='red', alpha=0.5, label='Model Prediction')
+    plt.xlabel('Date')
+    plt.ylabel('Daily Shootings')
+    plt.title('Model vs Observations')
+    plt.legend()
+    plt.gca().xaxis.set_major_locator(mdates.YearLocator())
+    #plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    plt.show()
