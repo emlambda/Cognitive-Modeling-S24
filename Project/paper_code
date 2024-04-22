@@ -104,6 +104,7 @@ if __name__ == '__main__':
     data = {
         'n': N,
         'y': df['shootings'].values.astype(int),
+        'overall': (df['jul']-df['jul'][0]).values.astype(int)+1,
         'ceasefire': df['ceasefire'].values.astype(int)+1,
         'mothersday': df['mothersday'].values.astype(int)+1,
         'yday': df['yearday'].values.astype(int),
@@ -115,6 +116,7 @@ if __name__ == '__main__':
     data {
         int<lower=1> n;                   // Number of observations
         array[n] int y;                   // Number of shootings per day
+        array[n] int overall;
         array[n] int ceasefire;
         array[n] int mothersday;
         array[n] int yday;
@@ -124,27 +126,37 @@ if __name__ == '__main__':
 
     parameters {
         vector[n] mu_innovations;
-        
+        vector[n] overall_effects;
         vector[366] yearly_effects;
         vector[7] weekday_effects;
         vector[2] ceasefire_effects;
         vector[2] mothersday_effects;
+        vector[4] season_effects;
         real<lower=0> sigma_mu;
+        real<lower=0> sigma_overall;
         real<lower=0> sigma_yday;
         real<lower=0> sigma_weekday;
         real<lower=0> sigma_binary;
+        real<lower=0> sigma_seasonal;
         real baseline;
-        //vector[2] ceasefire_effects;
         }
 
     transformed parameters {
-        // Zero-mean seasonal term
+        vector[n] y_overall;
         vector[366] y_year;
         vector[7] y_week;
         vector[2] y_cease;
         vector[2] y_mother;
+        vector[4] y_seasonal;
         vector[n] mu;
-        //vector[n] ceasefire_term;
+        {
+            vector[n] overall_with_trend;
+            real trend;
+            overall_with_trend = cumulative_sum(overall_effects);
+            trend = overall_with_trend[n];
+            for (i in 1:n)
+                y_overall[i] = sigma_overall/100 * (overall_with_trend[i] - trend * i/n);
+        }
 
         {
             vector[366] year_with_trend;
@@ -152,7 +164,7 @@ if __name__ == '__main__':
             year_with_trend = cumulative_sum(yearly_effects);
             trend = year_with_trend[366];
             for (i in 1:366)
-                y_year[i] = sigma_yday/100 * (year_with_trend[i] - trend * i/366.0);
+                y_year[i] = sigma_yday/100 * (year_with_trend[i] - trend * i/366);
         }
         {
             vector[7] week_with_trend;
@@ -160,7 +172,7 @@ if __name__ == '__main__':
             week_with_trend = cumulative_sum(weekday_effects);
             trend = week_with_trend[7];
             for (i in 1:7)
-                y_week[i] = sigma_weekday/100 * (week_with_trend[i] - trend * i/7.0);
+                y_week[i] = sigma_weekday/100 * (week_with_trend[i] - trend * i/7);
         }
         {
             vector[2] cease_with_trend;
@@ -176,17 +188,31 @@ if __name__ == '__main__':
                 y_mother[i] = sigma_binary/100 * (mother_with_trend[i] - mother_trend * i/2);
             }
         }
+        {
+            vector[4] season_with_trend;
+            real trend;
+            season_with_trend = cumulative_sum(season_effects);
+            trend = season_with_trend[4];
+            for (i in 1:4)
+                y_seasonal[i] = sigma_seasonal/100 * (season_with_trend[i] - trend * i/4);
+        }
         mu = sigma_mu/100 * cumulative_sum(mu_innovations);
-        
-        // Compute the weekday effects for each observation
     }
 
     model {
         yearly_effects ~ normal(0, 1);
+        weekday_effects ~ normal(0,1);
+        ceasefire_effects ~ normal(0,1);
+        mothersday_effects ~ normal(0,1);
+        season_effects ~ normal(0,1);
         mu_innovations ~ normal(0, 1);
-        y ~ poisson_log(baseline + mu + y_year[yday] + y_week[weekday] + y_cease[ceasefire] + y_mother[mothersday]);
+        y ~ poisson_log(baseline + mu + y_year[yday] + y_overall[overall] + y_week[weekday] + y_cease[ceasefire] + y_mother[mothersday] + y_seasonal[season]);
         sigma_mu ~ lognormal(-3.5 + log(100), 2);
+        sigma_overall ~ lognormal(-3.5 + log(100), 2);
         sigma_yday ~ lognormal(-3.5 + log(100), 2);
+        sigma_weekday ~ lognormal(-3.5 + log(100), 2);
+        sigma_binary ~ lognormal(-3.5 + log(100), 2);
+        sigma_seasonal ~ lognormal(-3.5 + log(100), 2);
     }
 
     generated quantities {
@@ -194,7 +220,7 @@ if __name__ == '__main__':
 
         // Compute the linear predictor for each observation
         for (i in 1:n) {
-            lin_pred[i] = baseline + mu[i] + y_year[yday[i]] + y_week[weekday[i]] + y_cease[ceasefire[i]] + y_mother[mothersday[i]];
+            lin_pred[i] = baseline + mu[i] + y_year[yday[i]] + y_overall[overall[i]] + y_week[weekday[i]] + y_cease[ceasefire[i]] + y_mother[mothersday[i]] + y_seasonal[season[i]];
         }
     }
 
